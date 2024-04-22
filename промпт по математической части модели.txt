@@ -1,0 +1,1739 @@
+Окей, давай теперь перейдем к разделу Математическая основа модели.
+
+У меня есть код, который обучает модель для определения ключевых точек человека, он разнесен по разным файлам. Я тебе буду присылать сейчас код этих файлов, а тебе необходимо будет расписать данный раздел максимально обширно. Раскрыть тему полностью, описать как конкретно он работает с точки зрения математики и архитектуры.
+
+train.py
+
+import datetime
+import os
+import time
+
+import torch
+import torch.utils.data
+import torchvision
+import torchvision.models.detection
+import torchvision.models.detection.mask_rcnn
+
+from dataset_helpers.coco_utils import get_coco, get_coco_kp
+
+from torchvision_libs.group_by_aspect_ratio import GroupedBatchSampler, create_aspect_ratio_groups
+from train_libs.engine import train_one_epoch, evaluate
+
+from torchvision_libs import utils, transforms as T
+
+device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+# device = torch.device('cpu')
+print(f"Using device: {device}")
+
+from torch.utils.data import Subset
+
+
+def get_dataset(name, image_set, transform, subset_size=None):
+    paths = {
+        "coco": (r'D:\COCO Dataset\coco2017', get_coco, 91),
+        "coco_kp": (r'D:\COCO Dataset\coco2017', get_coco_kp, 2)
+    }
+    p, ds_fn, num_classes = paths[name]
+
+    ds = ds_fn(p, image_set=image_set, transforms=transform)
+
+    if subset_size is not None:
+        indices = list(range(len(ds)))
+        subset_indices = indices[:subset_size]
+        ds = Subset(ds, subset_indices)
+
+    return ds, num_classes
+
+
+def get_transform(train):
+    transforms = []
+    transforms.append(T.ToTensor())
+    if train:
+        transforms.append(T.RandomHorizontalFlip(0.5))
+    return T.Compose(transforms)
+
+
+def main():
+    dataset_name = 'coco_kp'
+    model_name = 'keypointrcnn_resnet50_fpn'
+    batch_size = 2
+    epochs = 13
+    workers = 4
+    lr = 0.02
+    momentum = 0.9
+    weight_decay = 1e-4
+    lr_step_size = 8
+    lr_steps = [8, 11]
+    lr_gamma = 0.1
+    print_freq = 20
+    output_dir = '..'
+    resume_path = ''
+    aspect_ratio_group_factor = 0
+    test_only = False
+    pretrained = True
+
+    # Data loading code
+    print("Loading data")
+
+    dataset, num_classes = get_dataset(dataset_name, "train_libs", get_transform(train=True), subset_size=500)
+    dataset_test, _ = get_dataset(dataset_name, "val", get_transform(train=False), subset_size=50)
+
+    print("Creating data loaders")
+    train_sampler = torch.utils.data.RandomSampler(dataset)
+    test_sampler = torch.utils.data.SequentialSampler(dataset_test)
+
+    if aspect_ratio_group_factor >= 0:
+        group_ids = create_aspect_ratio_groups(dataset, k=aspect_ratio_group_factor)
+        train_batch_sampler = GroupedBatchSampler(train_sampler, group_ids, batch_size)
+    else:
+        train_batch_sampler = torch.utils.data.BatchSampler(
+            train_sampler, batch_size, drop_last=True)
+
+    data_loader = torch.utils.data.DataLoader(
+        dataset, batch_sampler=train_batch_sampler, num_workers=workers,
+        collate_fn=utils.collate_fn)
+
+    data_loader_test = torch.utils.data.DataLoader(
+        dataset_test, batch_size=1,
+        sampler=test_sampler, num_workers=workers,
+        collate_fn=utils.collate_fn)
+
+    print("Creating model")
+    model = torchvision.models.detection.__dict__[model_name](num_classes=num_classes,
+                                                              pretrained=pretrained)
+    model.to(device)
+
+    model_without_ddp = model
+
+    params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.SGD(
+        params, lr=lr, momentum=momentum, weight_decay=weight_decay)
+
+    lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=lr_steps, gamma=lr_gamma)
+
+    if resume_path:
+        checkpoint = torch.load(resume_path, map_location=device)
+        model_without_ddp.load_state_dict(checkpoint['model'])
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
+
+    if test_only:
+        evaluate(model, data_loader_test, device=device)
+        return
+
+    print("Start training")
+    start_time = time.time()
+    for epoch in range(epochs):
+        train_one_epoch(model, optimizer, data_loader, device, epoch, print_freq)
+        lr_scheduler.step()
+        if output_dir:
+            utils.save_on_master({
+                'model': model_without_ddp.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'lr_scheduler': lr_scheduler.state_dict()},
+                os.path.join(output_dir, 'model_{}.pth'.format(epoch)))
+
+        # evaluate after every epoch
+        evaluate(model, data_loader_test, device=device)
+
+    total_time = time.time() - start_time
+    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
+    print('Training time {}'.format(total_time_str))
+
+
+if __name__ == "__main__":
+    main()
+
+
+engine.py
+import math
+import sys
+import time
+import torch
+
+import torchvision.models.detection.mask_rcnn
+
+from dataset_helpers.coco_utils import get_coco_api_from_dataset
+from dataset_helpers.coco_eval import CocoEvaluator
+from torchvision_libs import utils
+
+
+def train_one_epoch(model, optimizer, data_loader, device, epoch, print_freq):
+    model.train()
+    metric_logger = utils.MetricLogger(delimiter="  ")
+    metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
+    header = 'Epoch: [{}]'.format(epoch)
+
+    lr_scheduler = None
+    if epoch == 0:
+        warmup_factor = 1. / 1000
+        warmup_iters = min(1000, len(data_loader) - 1)
+
+        lr_scheduler = utils.warmup_lr_scheduler(optimizer, warmup_iters, warmup_factor)
+
+    for images, targets in metric_logger.log_every(data_loader, print_freq, header):
+        images = list(image.to(device) for image in images)
+        targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+
+        loss_dict = model(images, targets)
+
+        losses = sum(loss for loss in loss_dict.values())
+
+        # reduce losses over all GPUs for logging purposes
+        loss_dict_reduced = utils.reduce_dict(loss_dict)
+        losses_reduced = sum(loss for loss in loss_dict_reduced.values())
+
+        loss_value = losses_reduced.item()
+
+        if not math.isfinite(loss_value):
+            print("Loss is {}, stopping training".format(loss_value))
+            print(loss_dict_reduced)
+            sys.exit(1)
+
+        optimizer.zero_grad()
+        losses.backward()
+        optimizer.step()
+
+        if lr_scheduler is not None:
+            lr_scheduler.step()
+
+        metric_logger.update(loss=losses_reduced, **loss_dict_reduced)
+        metric_logger.update(lr=optimizer.param_groups[0]["lr"])
+
+
+def _get_iou_types(model):
+    model_without_ddp = model
+    if isinstance(model, torch.nn.parallel.DistributedDataParallel):
+        model_without_ddp = model.module
+    iou_types = ["bbox"]
+    if isinstance(model_without_ddp, torchvision.models.detection.MaskRCNN):
+        iou_types.append("segm")
+    if isinstance(model_without_ddp, torchvision.models.detection.KeypointRCNN):
+        iou_types.append("keypoints")
+    return iou_types
+
+
+@torch.no_grad()
+def evaluate(model, data_loader, device):
+    n_threads = torch.get_num_threads()
+    cpu_device = "cpu"
+
+    model.eval().to(device)  # Move the model to GPU
+    metric_logger = utils.MetricLogger(delimiter="  ")
+    header = 'Test:'
+
+    coco = get_coco_api_from_dataset(data_loader.dataset)
+    iou_types = _get_iou_types(model)
+    coco_evaluator = CocoEvaluator(coco, iou_types)
+
+    for images, targets in metric_logger.log_every(data_loader, 100, header):
+        images = list(img.to(device) for img in images)
+        targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+
+        torch.cuda.synchronize()
+        model_time = time.time()
+
+        # Wrap the following block with torch.no_grad() to avoid any potential GPU errors
+        with torch.no_grad():
+            outputs = model(images)
+
+        # Assuming paste_masks_in_image is part of the model
+        # You may need to adjust this part based on your actual implementation
+        # Move the outputs to CPU
+        outputs = [{k: v.to(cpu_device) for k, v in t.items()} for t in outputs]
+
+        model_time = time.time() - model_time
+
+        res = {target["image_id"].item(): output for target, output in zip(targets, outputs)}
+        evaluator_time = time.time()
+        coco_evaluator.update(res)
+        evaluator_time = time.time() - evaluator_time
+        metric_logger.update(model_time=model_time, evaluator_time=evaluator_time)
+
+    # gather the stats from all processes
+    metric_logger.synchronize_between_processes()
+    print("Averaged stats:", metric_logger)
+    coco_evaluator.synchronize_between_processes()
+
+    # accumulate predictions from all images
+    coco_evaluator.accumulate()
+    coco_evaluator.summarize()
+    torch.set_num_threads(n_threads)
+    return coco_evaluator
+
+dataset_helpers.coco_eval
+import json
+
+import numpy as np
+import copy
+import torch
+
+from pycocotools.cocoeval import COCOeval
+from pycocotools.coco import COCO
+import pycocotools.mask as mask_util
+
+from collections import defaultdict
+
+from torchvision_libs import utils
+
+
+class CocoEvaluator(object):
+    def __init__(self, coco_gt, iou_types):
+        assert isinstance(iou_types, (list, tuple))
+        coco_gt = copy.deepcopy(coco_gt)
+        self.coco_gt = coco_gt
+
+        self.iou_types = iou_types
+        self.coco_eval = {}
+        for iou_type in iou_types:
+            self.coco_eval[iou_type] = COCOeval(coco_gt, iouType=iou_type)
+
+        self.img_ids = []
+        self.eval_imgs = {k: [] for k in iou_types}
+
+    def update(self, predictions):
+        img_ids = list(np.unique(list(predictions.keys())))
+        self.img_ids.extend(img_ids)
+
+        for iou_type in self.iou_types:
+            results = self.prepare(predictions, iou_type)
+            coco_dt = loadRes(self.coco_gt, results) if results else COCO()
+            coco_eval = self.coco_eval[iou_type]
+
+            coco_eval.cocoDt = coco_dt
+            coco_eval.params.imgIds = list(img_ids)
+            img_ids, eval_imgs = evaluate(coco_eval)
+
+            self.eval_imgs[iou_type].append(eval_imgs)
+
+    def synchronize_between_processes(self):
+        for iou_type in self.iou_types:
+            self.eval_imgs[iou_type] = np.concatenate(self.eval_imgs[iou_type], 2)
+            create_common_coco_eval(self.coco_eval[iou_type], self.img_ids, self.eval_imgs[iou_type])
+
+    def accumulate(self):
+        for coco_eval in self.coco_eval.values():
+            coco_eval.accumulate()
+
+    def summarize(self):
+        for iou_type, coco_eval in self.coco_eval.items():
+            print("IoU metric: {}".format(iou_type))
+            coco_eval.summarize()
+
+    def prepare(self, predictions, iou_type):
+        if iou_type == "bbox":
+            return self.prepare_for_coco_detection(predictions)
+        elif iou_type == "segm":
+            return self.prepare_for_coco_segmentation(predictions)
+        elif iou_type == "keypoints":
+            return self.prepare_for_coco_keypoint(predictions)
+        else:
+            raise ValueError("Unknown iou type {}".format(iou_type))
+
+    def prepare_for_coco_detection(self, predictions):
+        coco_results = []
+        for original_id, prediction in predictions.items():
+            if len(prediction) == 0:
+                continue
+
+            boxes = prediction["boxes"]
+            boxes = convert_to_xywh(boxes).tolist()
+            scores = prediction["scores"].tolist()
+            labels = prediction["labels"].tolist()
+
+            coco_results.extend(
+                [
+                    {
+                        "image_id": original_id,
+                        "category_id": labels[k],
+                        "bbox": box,
+                        "score": scores[k],
+                    }
+                    for k, box in enumerate(boxes)
+                ]
+            )
+        return coco_results
+
+    def prepare_for_coco_segmentation(self, predictions):
+        coco_results = []
+        for original_id, prediction in predictions.items():
+            if len(prediction) == 0:
+                continue
+
+            scores = prediction["scores"]
+            labels = prediction["labels"]
+            masks = prediction["masks"]
+
+            masks = masks > 0.5
+
+            scores = prediction["scores"].tolist()
+            labels = prediction["labels"].tolist()
+
+            rles = [
+                mask_util.encode(np.array(mask[0, :, :, np.newaxis], order="F"))[0]
+                for mask in masks
+            ]
+            for rle in rles:
+                rle["counts"] = rle["counts"].decode("utf-8")
+
+            coco_results.extend(
+                [
+                    {
+                        "image_id": original_id,
+                        "category_id": labels[k],
+                        "segmentation": rle,
+                        "score": scores[k],
+                    }
+                    for k, rle in enumerate(rles)
+                ]
+            )
+        return coco_results
+
+    def prepare_for_coco_keypoint(self, predictions):
+        coco_results = []
+        for original_id, prediction in predictions.items():
+            if len(prediction) == 0:
+                continue
+
+            boxes = prediction["boxes"]
+            boxes = convert_to_xywh(boxes).tolist()
+            scores = prediction["scores"].tolist()
+            labels = prediction["labels"].tolist()
+            keypoints = prediction["keypoints"]
+            keypoints = keypoints.flatten(start_dim=1).tolist()
+
+            coco_results.extend(
+                [
+                    {
+                        "image_id": original_id,
+                        "category_id": labels[k],
+                        'keypoints': keypoint,
+                        "score": scores[k],
+                    }
+                    for k, keypoint in enumerate(keypoints)
+                ]
+            )
+        return coco_results
+
+
+def convert_to_xywh(boxes):
+    xmin, ymin, xmax, ymax = boxes.unbind(1)
+    return torch.stack((xmin, ymin, xmax - xmin, ymax - ymin), dim=1)
+
+
+def merge(img_ids, eval_imgs):
+    all_img_ids = utils.all_gather(img_ids)
+    all_eval_imgs = utils.all_gather(eval_imgs)
+
+    merged_img_ids = []
+    for p in all_img_ids:
+        merged_img_ids.extend(p)
+
+    merged_eval_imgs = []
+    for p in all_eval_imgs:
+        merged_eval_imgs.append(p)
+
+    merged_img_ids = np.array(merged_img_ids)
+    merged_eval_imgs = np.concatenate(merged_eval_imgs, 2)
+
+    # keep only unique (and in sorted order) images
+    merged_img_ids, idx = np.unique(merged_img_ids, return_index=True)
+    merged_eval_imgs = merged_eval_imgs[..., idx]
+
+    return merged_img_ids, merged_eval_imgs
+
+
+def create_common_coco_eval(coco_eval, img_ids, eval_imgs):
+    img_ids, eval_imgs = merge(img_ids, eval_imgs)
+    img_ids = list(img_ids)
+    eval_imgs = list(eval_imgs.flatten())
+
+    coco_eval.evalImgs = eval_imgs
+    coco_eval.params.imgIds = img_ids
+    coco_eval._paramsEval = copy.deepcopy(coco_eval.params)
+
+
+#################################################################
+# From pycocotools, just removed the prints and fixed
+# a Python3 bug about unicode not defined
+#################################################################
+
+# Ideally, pycocotools wouldn't have hard-coded prints
+# so that we could avoid copy-pasting those two functions
+
+def createIndex(self):
+    # create index
+    # print('creating index...')
+    anns, cats, imgs = {}, {}, {}
+    imgToAnns, catToImgs = defaultdict(list), defaultdict(list)
+    if 'annotations' in self.dataset:
+        for ann in self.dataset['annotations']:
+            imgToAnns[ann['image_id']].append(ann)
+            anns[ann['id']] = ann
+
+    if 'images' in self.dataset:
+        for img in self.dataset['images']:
+            imgs[img['id']] = img
+
+    if 'categories' in self.dataset:
+        for cat in self.dataset['categories']:
+            cats[cat['id']] = cat
+
+    if 'annotations' in self.dataset and 'categories' in self.dataset:
+        for ann in self.dataset['annotations']:
+            catToImgs[ann['category_id']].append(ann['image_id'])
+
+    # print('index created!')
+
+    # create class members
+    self.anns = anns
+    self.imgToAnns = imgToAnns
+    self.catToImgs = catToImgs
+    self.imgs = imgs
+    self.cats = cats
+
+
+maskUtils = mask_util
+
+
+def loadRes(self, resFile):
+    """
+    Load result file and return a result api object.
+    :param   resFile (str)     : file name of result file
+    :return: res (obj)         : result api object
+    """
+    res = COCO()
+    res.dataset['images'] = [img for img in self.dataset['images']]
+
+    # print('Loading and preparing results...')
+    # tic = time.time()
+    if isinstance(resFile, str):
+        anns = json.load(open(resFile))
+    elif isinstance(resFile, np.ndarray):
+        anns = self.loadNumpyAnnotations(resFile)
+    else:
+        anns = resFile
+    assert type(anns) == list, 'results in not an array of objects'
+    annsImgIds = [ann['image_id'] for ann in anns]
+    assert set(annsImgIds) == (set(annsImgIds) & set(self.getImgIds())), \
+        'Results do not correspond to current coco set'
+    if 'caption' in anns[0]:
+        imgIds = set([img['id'] for img in res.dataset['images']]) & set([ann['image_id'] for ann in anns])
+        res.dataset['images'] = [img for img in res.dataset['images'] if img['id'] in imgIds]
+        for id, ann in enumerate(anns):
+            ann['id'] = id + 1
+    elif 'bbox' in anns[0] and not anns[0]['bbox'] == []:
+        res.dataset['categories'] = copy.deepcopy(self.dataset['categories'])
+        for id, ann in enumerate(anns):
+            bb = ann['bbox']
+            x1, x2, y1, y2 = [bb[0], bb[0] + bb[2], bb[1], bb[1] + bb[3]]
+            if 'segmentation' not in ann:
+                ann['segmentation'] = [[x1, y1, x1, y2, x2, y2, x2, y1]]
+            ann['area'] = bb[2] * bb[3]
+            ann['id'] = id + 1
+            ann['iscrowd'] = 0
+    elif 'segmentation' in anns[0]:
+        res.dataset['categories'] = copy.deepcopy(self.dataset['categories'])
+        for id, ann in enumerate(anns):
+            # now only support compressed RLE format as segmentation results
+            ann['area'] = maskUtils.area(ann['segmentation'])
+            if 'bbox' not in ann:
+                ann['bbox'] = maskUtils.toBbox(ann['segmentation'])
+            ann['id'] = id + 1
+            ann['iscrowd'] = 0
+    elif 'keypoints' in anns[0]:
+        res.dataset['categories'] = copy.deepcopy(self.dataset['categories'])
+        for id, ann in enumerate(anns):
+            s = ann['keypoints']
+            x = s[0::3]
+            y = s[1::3]
+            x0, x1, y0, y1 = np.min(x), np.max(x), np.min(y), np.max(y)
+            ann['area'] = (x1 - x0) * (y1 - y0)
+            ann['id'] = id + 1
+            ann['bbox'] = [x0, y0, x1 - x0, y1 - y0]
+    # print('DONE (t={:0.2f}s)'.format(time.time()- tic))
+
+    res.dataset['annotations'] = anns
+    createIndex(res)
+    return res
+
+
+def evaluate(self):
+    '''
+    Run per image evaluation on given images and store results (a list of dict) in self.evalImgs
+    :return: None
+    '''
+    # tic = time.time()
+    # print('Running per image evaluation...')
+    p = self.params
+    # add backward compatibility if useSegm is specified in params
+    if p.useSegm is not None:
+        p.iouType = 'segm' if p.useSegm == 1 else 'bbox'
+        print('useSegm (deprecated) is not None. Running {} evaluation'.format(p.iouType))
+    # print('Evaluate annotation type *{}*'.format(p.iouType))
+    p.imgIds = list(np.unique(p.imgIds))
+    if p.useCats:
+        p.catIds = list(np.unique(p.catIds))
+    p.maxDets = sorted(p.maxDets)
+    self.params = p
+
+    self._prepare()
+    # loop through images, area range, max detection number
+    catIds = p.catIds if p.useCats else [-1]
+
+    if p.iouType == 'segm' or p.iouType == 'bbox':
+        computeIoU = self.computeIoU
+    elif p.iouType == 'keypoints':
+        computeIoU = self.computeOks
+    self.ious = {
+        (imgId, catId): computeIoU(imgId, catId)
+        for imgId in p.imgIds
+        for catId in catIds}
+
+    evaluateImg = self.evaluateImg
+    maxDet = p.maxDets[-1]
+    evalImgs = [
+        evaluateImg(imgId, catId, areaRng, maxDet)
+        for catId in catIds
+        for areaRng in p.areaRng
+        for imgId in p.imgIds
+    ]
+    # this is NOT in the pycocotools code, but could be done outside
+    evalImgs = np.asarray(evalImgs).reshape(len(catIds), len(p.areaRng), len(p.imgIds))
+    self._paramsEval = copy.deepcopy(self.params)
+    # toc = time.time()
+    # print('DONE (t={:0.2f}s).'.format(toc-tic))
+    return p.imgIds, evalImgs
+
+#################################################################
+# end of straight copy from pycocotools, just removing the prints
+#################################################################
+
+
+dataset_helpers.coco_utils
+import copy
+import os
+
+import torch
+import torch.utils.data
+import torchvision
+
+from pycocotools import mask as coco_mask
+from pycocotools.coco import COCO
+
+from torchvision_libs import transforms as T
+
+
+class FilterAndRemapCocoCategories(object):
+    def __init__(self, categories, remap=True):
+        self.categories = categories
+        self.remap = remap
+
+    def __call__(self, image, target):
+        anno = target["annotations"]
+        anno = [obj for obj in anno if obj["category_id"] in self.categories]
+        if not self.remap:
+            target["annotations"] = anno
+            return image, target
+        anno = copy.deepcopy(anno)
+        for obj in anno:
+            obj["category_id"] = self.categories.index(obj["category_id"])
+        target["annotations"] = anno
+        return image, target
+
+
+def convert_coco_poly_to_mask(segmentations, height, width):
+    masks = []
+    for polygons in segmentations:
+        rles = coco_mask.frPyObjects(polygons, height, width)
+        mask = coco_mask.decode(rles)
+        if len(mask.shape) < 3:
+            mask = mask[..., None]
+        mask = torch.as_tensor(mask, dtype=torch.uint8)
+        mask = mask.any(dim=2)
+        masks.append(mask)
+    if masks:
+        masks = torch.stack(masks, dim=0)
+    else:
+        masks = torch.zeros((0, height, width), dtype=torch.uint8)
+    return masks
+
+
+class ConvertCocoPolysToMask(object):
+    def __call__(self, image, target):
+        w, h = image.size
+
+        image_id = target["image_id"]
+        image_id = torch.tensor([image_id])
+
+        anno = target["annotations"]
+
+        anno = [obj for obj in anno if obj['iscrowd'] == 0]
+
+        boxes = [obj["bbox"] for obj in anno]
+        # guard against no boxes via resizing
+        boxes = torch.as_tensor(boxes, dtype=torch.float32).reshape(-1, 4)
+        boxes[:, 2:] += boxes[:, :2]
+        boxes[:, 0::2].clamp_(min=0, max=w)
+        boxes[:, 1::2].clamp_(min=0, max=h)
+
+        classes = [obj["category_id"] for obj in anno]
+        classes = torch.tensor(classes, dtype=torch.int64)
+
+        segmentations = [obj["segmentation"] for obj in anno]
+        masks = convert_coco_poly_to_mask(segmentations, h, w)
+
+        keypoints = None
+        if anno and "keypoints" in anno[0]:
+            keypoints = [obj["keypoints"] for obj in anno]
+            keypoints = torch.as_tensor(keypoints, dtype=torch.float32)
+            num_keypoints = keypoints.shape[0]
+            if num_keypoints:
+                keypoints = keypoints.view(num_keypoints, -1, 3)
+
+        keep = (boxes[:, 3] > boxes[:, 1]) & (boxes[:, 2] > boxes[:, 0])
+        boxes = boxes[keep]
+        classes = classes[keep]
+        masks = masks[keep]
+        if keypoints is not None:
+            keypoints = keypoints[keep]
+
+        target = {}
+        target["boxes"] = boxes
+        target["labels"] = classes
+        target["masks"] = masks
+        target["image_id"] = image_id
+        if keypoints is not None:
+            target["keypoints"] = keypoints
+
+        # for conversion to coco api
+        area = torch.tensor([obj["area"] for obj in anno])
+        iscrowd = torch.tensor([obj["iscrowd"] for obj in anno])
+        target["area"] = area
+        target["iscrowd"] = iscrowd
+
+        return image, target
+
+
+def _coco_remove_images_without_annotations(dataset, cat_list=None):
+    def _has_only_empty_bbox(anno):
+        return all(any(o <= 1 for o in obj["bbox"][2:]) for obj in anno)
+
+    def _count_visible_keypoints(anno):
+        return sum(sum(1 for v in ann["keypoints"][2::3] if v > 0) for ann in anno)
+
+    min_keypoints_per_image = 10
+
+    def _has_valid_annotation(anno):
+        # if it's empty, there is no annotation
+        if len(anno) == 0:
+            return False
+        # if all boxes have close to zero area, there is no annotation
+        if _has_only_empty_bbox(anno):
+            return False
+        # keypoints task have a slight different critera for considering
+        # if an annotation is valid
+        if "keypoints" not in anno[0]:
+            return True
+        # for keypoint detection tasks, only consider valid images those
+        # containing at least min_keypoints_per_image
+        if _count_visible_keypoints(anno) >= min_keypoints_per_image:
+            return True
+        return False
+
+    assert isinstance(dataset, torchvision.datasets.CocoDetection)
+    ids = []
+    for ds_idx, img_id in enumerate(dataset.ids):
+        ann_ids = dataset.coco.getAnnIds(imgIds=img_id, iscrowd=None)
+        anno = dataset.coco.loadAnns(ann_ids)
+        if cat_list:
+            anno = [obj for obj in anno if obj["category_id"] in cat_list]
+        if _has_valid_annotation(anno):
+            ids.append(ds_idx)
+
+    dataset = torch.utils.data.Subset(dataset, ids)
+    return dataset
+
+
+def convert_to_coco_api(ds):
+    coco_ds = COCO()
+    ann_id = 0
+    dataset = {'images': [], 'categories': [], 'annotations': []}
+    categories = set()
+    for img_idx in range(len(ds)):
+        # find better way to get target
+        # targets = ds.get_annotations(img_idx)
+        img, targets = ds[img_idx]
+        image_id = targets["image_id"].item()
+        img_dict = {}
+        img_dict['id'] = image_id
+        img_dict['height'] = img.shape[-2]
+        img_dict['width'] = img.shape[-1]
+        dataset['images'].append(img_dict)
+        bboxes = targets["boxes"]
+        bboxes[:, 2:] -= bboxes[:, :2]
+        bboxes = bboxes.tolist()
+        labels = targets['labels'].tolist()
+        areas = targets['area'].tolist()
+        iscrowd = targets['iscrowd'].tolist()
+        if 'masks' in targets:
+            masks = targets['masks']
+            # make masks Fortran contiguous for coco_mask
+            masks = masks.permute(0, 2, 1).contiguous().permute(0, 2, 1)
+        if 'keypoints' in targets:
+            keypoints = targets['keypoints']
+            keypoints = keypoints.reshape(keypoints.shape[0], -1).tolist()
+        num_objs = len(bboxes)
+        for i in range(num_objs):
+            ann = {}
+            ann['image_id'] = image_id
+            ann['bbox'] = bboxes[i]
+            ann['category_id'] = labels[i]
+            categories.add(labels[i])
+            ann['area'] = areas[i]
+            ann['iscrowd'] = iscrowd[i]
+            ann['id'] = ann_id
+            if 'masks' in targets:
+                ann["segmentation"] = coco_mask.encode(masks[i].numpy())
+            if 'keypoints' in targets:
+                ann['keypoints'] = keypoints[i]
+                ann['num_keypoints'] = sum(k != 0 for k in keypoints[i][2::3])
+            dataset['annotations'].append(ann)
+            ann_id += 1
+    dataset['categories'] = [{'id': i} for i in sorted(categories)]
+    coco_ds.dataset = dataset
+    coco_ds.createIndex()
+    return coco_ds
+
+
+def get_coco_api_from_dataset(dataset):
+    for i in range(10):
+        if isinstance(dataset, torchvision.datasets.CocoDetection):
+            break
+        if isinstance(dataset, torch.utils.data.Subset):
+            dataset = dataset.dataset
+    if isinstance(dataset, torchvision.datasets.CocoDetection):
+        return dataset.coco
+    return convert_to_coco_api(dataset)
+
+
+class CocoDetection(torchvision.datasets.CocoDetection):
+    def __init__(self, img_folder, ann_file, transforms):
+        super(CocoDetection, self).__init__(img_folder, ann_file)
+        self._transforms = transforms
+
+    def __getitem__(self, idx):
+        img, target = super(CocoDetection, self).__getitem__(idx)
+        image_id = self.ids[idx]
+        target = dict(image_id=image_id, annotations=target)
+        if self._transforms is not None:
+            img, target = self._transforms(img, target)
+        return img, target
+
+
+def get_coco(root, image_set, transforms, mode='instances'):
+    anno_file_template = "{}_{}2017.json"
+    PATHS = {
+        "train_libs": ("train2017", os.path.join("annotations", anno_file_template.format(mode, "train_libs"))),
+        "val": ("val2017", os.path.join("annotations", anno_file_template.format(mode, "val"))),
+        # "train_libs": ("val2017", os.path.join("annotations", anno_file_template.format(mode, "val")))
+    }
+
+    t = [ConvertCocoPolysToMask()]
+
+    if transforms is not None:
+        t.append(transforms)
+    transforms = T.Compose(t)
+
+    img_folder, ann_file = PATHS[image_set]
+    img_folder = os.path.join(root, img_folder)
+    ann_file = os.path.join(root, ann_file)
+
+    dataset = CocoDetection(img_folder, ann_file, transforms=transforms)
+
+    if image_set == "train_libs":
+        dataset = _coco_remove_images_without_annotations(dataset)
+
+    # dataset = torch.utils.data.Subset(dataset, [i for i in range(500)])
+
+    return dataset
+
+
+def get_coco_kp(root, image_set, transforms):
+    return get_coco(root, image_set, transforms, mode="person_keypoints")
+
+
+torchvision_libs.utils
+from __future__ import print_function
+
+from collections import defaultdict, deque
+import datetime
+import pickle
+import time
+
+import torch
+import torch.distributed as dist
+
+import errno
+import os
+
+
+class SmoothedValue(object):
+    """Track a series of values and provide access to smoothed values over a
+    window or the global series average.
+    """
+
+    def __init__(self, window_size=20, fmt=None):
+        if fmt is None:
+            fmt = "{median:.4f} ({global_avg:.4f})"
+        self.deque = deque(maxlen=window_size)
+        self.total = 0.0
+        self.count = 0
+        self.fmt = fmt
+
+    def update(self, value, n=1):
+        self.deque.append(value)
+        self.count += n
+        self.total += value * n
+
+    def synchronize_between_processes(self):
+        """
+        Warning: does not synchronize the deque!
+        """
+        if not is_dist_avail_and_initialized():
+            return
+        t = torch.tensor([self.count, self.total], dtype=torch.float64, device='cuda')
+        dist.barrier()
+        dist.all_reduce(t)
+        t = t.tolist()
+        self.count = int(t[0])
+        self.total = t[1]
+
+    @property
+    def median(self):
+        d = torch.tensor(list(self.deque))
+        return d.median().item()
+
+    @property
+    def avg(self):
+        d = torch.tensor(list(self.deque), dtype=torch.float32)
+        return d.mean().item()
+
+    @property
+    def global_avg(self):
+        return self.total / self.count
+
+    @property
+    def max(self):
+        return max(self.deque)
+
+    @property
+    def value(self):
+        return self.deque[-1]
+
+    def __str__(self):
+        return self.fmt.format(
+            median=self.median,
+            avg=self.avg,
+            global_avg=self.global_avg,
+            max=self.max,
+            value=self.value)
+
+
+def all_gather(data):
+    """
+    Run all_gather on arbitrary picklable data (not necessarily tensors)
+    Args:
+        data: any picklable object
+    Returns:
+        list[data]: list of data gathered from each rank
+    """
+    world_size = get_world_size()
+    if world_size == 1:
+        return [data]
+
+    # serialized to a Tensor
+    buffer = pickle.dumps(data)
+    storage = torch.ByteStorage.from_buffer(buffer)
+    tensor = torch.ByteTensor(storage).to("cuda")
+
+    # obtain Tensor size of each rank
+    local_size = torch.tensor([tensor.numel()], device="cuda")
+    size_list = [torch.tensor([0], device="cuda") for _ in range(world_size)]
+    dist.all_gather(size_list, local_size)
+    size_list = [int(size.item()) for size in size_list]
+    max_size = max(size_list)
+
+    # receiving Tensor from all ranks
+    # we pad the tensor because torch all_gather does not support
+    # gathering tensors of different shapes
+    tensor_list = []
+    for _ in size_list:
+        tensor_list.append(torch.empty((max_size,), dtype=torch.uint8, device="cuda"))
+    if local_size != max_size:
+        padding = torch.empty(size=(max_size - local_size,), dtype=torch.uint8, device="cuda")
+        tensor = torch.cat((tensor, padding), dim=0)
+    dist.all_gather(tensor_list, tensor)
+
+    data_list = []
+    for size, tensor in zip(size_list, tensor_list):
+        buffer = tensor.cpu().numpy().tobytes()[:size]
+        data_list.append(pickle.loads(buffer))
+
+    return data_list
+
+
+def reduce_dict(input_dict, average=True):
+    """
+    Args:
+        input_dict (dict): all the values will be reduced
+        average (bool): whether to do average or sum
+    Reduce the values in the dictionary from all processes so that all processes
+    have the averaged results. Returns a dict with the same fields as
+    input_dict, after reduction.
+    """
+    world_size = get_world_size()
+    if world_size < 2:
+        return input_dict
+    with torch.no_grad():
+        names = []
+        values = []
+        # sort the keys so that they are consistent across processes
+        for k in sorted(input_dict.keys()):
+            names.append(k)
+            values.append(input_dict[k])
+        values = torch.stack(values, dim=0)
+        dist.all_reduce(values)
+        if average:
+            values /= world_size
+        reduced_dict = {k: v for k, v in zip(names, values)}
+    return reduced_dict
+
+
+class MetricLogger(object):
+    def __init__(self, delimiter="\t"):
+        self.meters = defaultdict(SmoothedValue)
+        self.delimiter = delimiter
+
+    def update(self, **kwargs):
+        for k, v in kwargs.items():
+            if isinstance(v, torch.Tensor):
+                v = v.item()
+            assert isinstance(v, (float, int))
+            self.meters[k].update(v)
+
+    def __getattr__(self, attr):
+        if attr in self.meters:
+            return self.meters[attr]
+        if attr in self.__dict__:
+            return self.__dict__[attr]
+        raise AttributeError("'{}' object has no attribute '{}'".format(
+            type(self).__name__, attr))
+
+    def __str__(self):
+        loss_str = []
+        for name, meter in self.meters.items():
+            loss_str.append(
+                "{}: {}".format(name, str(meter))
+            )
+        return self.delimiter.join(loss_str)
+
+    def synchronize_between_processes(self):
+        for meter in self.meters.values():
+            meter.synchronize_between_processes()
+
+    def add_meter(self, name, meter):
+        self.meters[name] = meter
+
+    def log_every(self, iterable, print_freq, header=None):
+        i = 0
+        if not header:
+            header = ''
+        start_time = time.time()
+        end = time.time()
+        iter_time = SmoothedValue(fmt='{avg:.4f}')
+        data_time = SmoothedValue(fmt='{avg:.4f}')
+        space_fmt = ':' + str(len(str(len(iterable)))) + 'd'
+        log_msg = self.delimiter.join([
+            header,
+            '[{0' + space_fmt + '}/{1}]',
+            'eta: {eta}',
+            '{meters}',
+            'time: {time}',
+            'data: {data}',
+            'max mem: {memory:.0f}'
+        ])
+        MB = 1024.0 * 1024.0
+        for obj in iterable:
+            data_time.update(time.time() - end)
+            yield obj
+            iter_time.update(time.time() - end)
+            if i % print_freq == 0 or i == len(iterable) - 1:
+                eta_seconds = iter_time.global_avg * (len(iterable) - i)
+                eta_string = str(datetime.timedelta(seconds=int(eta_seconds)))
+                print(log_msg.format(
+                    i, len(iterable), eta=eta_string,
+                    meters=str(self),
+                    time=str(iter_time), data=str(data_time),
+                    memory=torch.cuda.max_memory_allocated() / MB))
+            i += 1
+            end = time.time()
+        total_time = time.time() - start_time
+        total_time_str = str(datetime.timedelta(seconds=int(total_time)))
+        print('{} Total time: {} ({:.4f} s / it)'.format(
+            header, total_time_str, total_time / len(iterable)))
+
+
+def collate_fn(batch):
+    return tuple(zip(*batch))
+
+
+def warmup_lr_scheduler(optimizer, warmup_iters, warmup_factor):
+
+    def f(x):
+        if x >= warmup_iters:
+            return 1
+        alpha = float(x) / warmup_iters
+        return warmup_factor * (1 - alpha) + alpha
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, f)
+
+
+def mkdir(path):
+    try:
+        os.makedirs(path)
+    except OSError as e:
+        if e.errno != errno.EEXIST:
+            raise
+
+
+def setup_for_distributed(is_master):
+    """
+    This function disables printing when not in master process
+    """
+    import builtins as __builtin__
+    builtin_print = __builtin__.print
+
+    def print(*args, **kwargs):
+        force = kwargs.pop('force', False)
+        if is_master or force:
+            builtin_print(*args, **kwargs)
+
+    __builtin__.print = print
+
+
+def is_dist_avail_and_initialized():
+    if not dist.is_available():
+        return False
+    if not dist.is_initialized():
+        return False
+    return True
+
+
+def get_world_size():
+    if not is_dist_avail_and_initialized():
+        return 1
+    return dist.get_world_size()
+
+
+def get_rank():
+    if not is_dist_avail_and_initialized():
+        return 0
+    return dist.get_rank()
+
+
+def is_main_process():
+    return get_rank() == 0
+
+
+def save_on_master(*args, **kwargs):
+    if is_main_process():
+        torch.save(*args, **kwargs)
+
+
+def init_distributed_mode(args):
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        args.rank = int(os.environ["RANK"])
+        args.world_size = int(os.environ['WORLD_SIZE'])
+        args.gpu = int(os.environ['LOCAL_RANK'])
+    elif 'SLURM_PROCID' in os.environ:
+        args.rank = int(os.environ['SLURM_PROCID'])
+        args.gpu = args.rank % torch.cuda.device_count()
+    else:
+        print('Not using distributed mode')
+        args.distributed = False
+        return
+
+    args.distributed = True
+
+    torch.cuda.set_device(args.gpu)
+    args.dist_backend = 'nccl'
+    print('| distributed init (rank {}): {}'.format(
+        args.rank, args.dist_url), flush=True)
+    torch.distributed.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
+                                         world_size=args.world_size, rank=args.rank)
+    torch.distributed.barrier()
+    setup_for_distributed(args.rank == 0)
+
+torchvision_libs.transforms
+import random
+import torch
+
+from torchvision.transforms import functional as F
+
+
+def _flip_coco_person_keypoints(kps, width):
+    flip_inds = [0, 2, 1, 4, 3, 6, 5, 8, 7, 10, 9, 12, 11, 14, 13, 16, 15]
+    flipped_data = kps[:, flip_inds]
+    flipped_data[..., 0] = width - flipped_data[..., 0]
+    # Maintain COCO convention that if visibility == 0, then x, y = 0
+    inds = flipped_data[..., 2] == 0
+    flipped_data[inds] = 0
+    return flipped_data
+
+
+class Compose(object):
+    def __init__(self, transforms):
+        self.transforms = transforms
+
+    def __call__(self, image, target):
+        for t in self.transforms:
+            image, target = t(image, target)
+        return image, target
+
+
+class RandomHorizontalFlip(object):
+    def __init__(self, prob):
+        self.prob = prob
+
+    def __call__(self, image, target):
+        if random.random() < self.prob:
+            height, width = image.shape[-2:]
+            image = image.flip(-1)
+            bbox = target["boxes"]
+            bbox[:, [0, 2]] = width - bbox[:, [2, 0]]
+            target["boxes"] = bbox
+            if "masks" in target:
+                target["masks"] = target["masks"].flip(-1)
+            if "keypoints" in target:
+                keypoints = target["keypoints"]
+                keypoints = _flip_coco_person_keypoints(keypoints, width)
+                target["keypoints"] = keypoints
+        return image, target
+
+
+class ToTensor(object):
+    def __call__(self, image, target):
+        image = F.to_tensor(image)
+        return image, target
+
+
+torchvision_libs.keypoint_rcnn:
+
+import torch
+from torch import nn
+
+from torchvision.ops import misc as misc_nn_ops
+from torchvision.ops import MultiScaleRoIAlign
+
+from ..utils import load_state_dict_from_url
+
+from .faster_rcnn import FasterRCNN
+from .backbone_utils import resnet_fpn_backbone
+
+
+__all__ = [
+    "KeypointRCNN", "keypointrcnn_resnet50_fpn"
+]
+
+
+class KeypointRCNN(FasterRCNN):
+    """
+    Implements Keypoint R-CNN.
+
+    The input to the model is expected to be a list of tensors, each of shape [C, H, W], one for each
+    image, and should be in 0-1 range. Different images can have different sizes.
+
+    The behavior of the model changes depending if it is in training or evaluation mode.
+
+    During training, the model expects both the input tensors, as well as a targets dictionary,
+    containing:
+        - boxes (Tensor[N, 4]): the ground-truth boxes in [x0, y0, x1, y1] format, with values
+          between 0 and H and 0 and W
+        - labels (Tensor[N]): the class label for each ground-truth box
+        - keypoints (Tensor[N, K, 3]): the K keypoints location for each of the N instances, in the
+          format [x, y, visibility], where visibility=0 means that the keypoint is not visible.
+
+    The model returns a Dict[Tensor] during training, containing the classification and regression
+    losses for both the RPN and the R-CNN, and the keypoint loss.
+
+    During inference, the model requires only the input tensors, and returns the post-processed
+    predictions as a List[Dict[Tensor]], one for each input image. The fields of the Dict are as
+    follows:
+        - boxes (Tensor[N, 4]): the predicted boxes in [x0, y0, x1, y1] format, with values between
+          0 and H and 0 and W
+        - labels (Tensor[N]): the predicted labels for each image
+        - scores (Tensor[N]): the scores or each prediction
+        - keypoints (Tensor[N, K, 3]): the locations of the predicted keypoints, in [x, y, v] format.
+
+    Arguments:
+        backbone (nn.Module): the network used to compute the features for the model.
+            It should contain a out_channels attribute, which indicates the number of output
+            channels that each feature map has (and it should be the same for all feature maps).
+            The backbone should return a single Tensor or and OrderedDict[Tensor].
+        num_classes (int): number of output classes of the model (including the background).
+            If box_predictor is specified, num_classes should be None.
+        min_size (int): minimum size of the image to be rescaled before feeding it to the backbone
+        max_size (int): maximum size of the image to be rescaled before feeding it to the backbone
+        image_mean (Tuple[float, float, float]): mean values used for input normalization.
+            They are generally the mean values of the dataset on which the backbone has been trained
+            on
+        image_std (Tuple[float, float, float]): std values used for input normalization.
+            They are generally the std values of the dataset on which the backbone has been trained on
+        rpn_anchor_generator (AnchorGenerator): module that generates the anchors for a set of feature
+            maps.
+        rpn_head (nn.Module): module that computes the objectness and regression deltas from the RPN
+        rpn_pre_nms_top_n_train (int): number of proposals to keep before applying NMS during training
+        rpn_pre_nms_top_n_test (int): number of proposals to keep before applying NMS during testing
+        rpn_post_nms_top_n_train (int): number of proposals to keep after applying NMS during training
+        rpn_post_nms_top_n_test (int): number of proposals to keep after applying NMS during testing
+        rpn_nms_thresh (float): NMS threshold used for postprocessing the RPN proposals
+        rpn_fg_iou_thresh (float): minimum IoU between the anchor and the GT box so that they can be
+            considered as positive during training of the RPN.
+        rpn_bg_iou_thresh (float): maximum IoU between the anchor and the GT box so that they can be
+            considered as negative during training of the RPN.
+        rpn_batch_size_per_image (int): number of anchors that are sampled during training of the RPN
+            for computing the loss
+        rpn_positive_fraction (float): proportion of positive anchors in a mini-batch during training
+            of the RPN
+        box_roi_pool (MultiScaleRoIAlign): the module which crops and resizes the feature maps in
+            the locations indicated by the bounding boxes
+        box_head (nn.Module): module that takes the cropped feature maps as input
+        box_predictor (nn.Module): module that takes the output of box_head and returns the
+            classification logits and box regression deltas.
+        box_score_thresh (float): during inference, only return proposals with a classification score
+            greater than box_score_thresh
+        box_nms_thresh (float): NMS threshold for the prediction head. Used during inference
+        box_detections_per_img (int): maximum number of detections per image, for all classes.
+        box_fg_iou_thresh (float): minimum IoU between the proposals and the GT box so that they can be
+            considered as positive during training of the classification head
+        box_bg_iou_thresh (float): maximum IoU between the proposals and the GT box so that they can be
+            considered as negative during training of the classification head
+        box_batch_size_per_image (int): number of proposals that are sampled during training of the
+            classification head
+        box_positive_fraction (float): proportion of positive proposals in a mini-batch during training
+            of the classification head
+        bbox_reg_weights (Tuple[float, float, float, float]): weights for the encoding/decoding of the
+            bounding boxes
+        keypoint_roi_pool (MultiScaleRoIAlign): the module which crops and resizes the feature maps in
+             the locations indicated by the bounding boxes, which will be used for the keypoint head.
+        keypoint_head (nn.Module): module that takes the cropped feature maps as input
+        keypoint_predictor (nn.Module): module that takes the output of the keypoint_head and returns the
+            heatmap logits
+
+    Example::
+
+        >>> import torchvision
+        >>> from torchvision.models.detection import KeypointRCNN
+        >>> from torchvision.models.detection.rpn import AnchorGenerator
+        >>>
+        >>> # load a pre-trained model for classification and return
+        >>> # only the features
+        >>> backbone = torchvision.models.mobilenet_v2(pretrained=True).features
+        >>> # KeypointRCNN needs to know the number of
+        >>> # output channels in a backbone. For mobilenet_v2, it's 1280
+        >>> # so we need to add it here
+        >>> backbone.out_channels = 1280
+        >>>
+        >>> # let's make the RPN generate 5 x 3 anchors per spatial
+        >>> # location, with 5 different sizes and 3 different aspect
+        >>> # ratios. We have a Tuple[Tuple[int]] because each feature
+        >>> # map could potentially have different sizes and
+        >>> # aspect ratios
+        >>> anchor_generator = AnchorGenerator(sizes=((32, 64, 128, 256, 512),),
+        >>>                                    aspect_ratios=((0.5, 1.0, 2.0),))
+        >>>
+        >>> # let's define what are the feature maps that we will
+        >>> # use to perform the region of interest cropping, as well as
+        >>> # the size of the crop after rescaling.
+        >>> # if your backbone returns a Tensor, featmap_names is expected to
+        >>> # be [0]. More generally, the backbone should return an
+        >>> # OrderedDict[Tensor], and in featmap_names you can choose which
+        >>> # feature maps to use.
+        >>> roi_pooler = torchvision.ops.MultiScaleRoIAlign(featmap_names=[0],
+        >>>                                                 output_size=7,
+        >>>                                                 sampling_ratio=2)
+        >>>
+        >>> keypoint_roi_pooler = torchvision.ops.MultiScaleRoIAlign(featmap_names=[0],
+        >>>                                                          output_size=14,
+        >>>                                                          sampling_ratio=2)
+        >>> # put the pieces together inside a FasterRCNN model
+        >>> model = KeypointRCNN(backbone,
+        >>>                      num_classes=2,
+        >>>                      rpn_anchor_generator=anchor_generator,
+        >>>                      box_roi_pool=roi_pooler,
+        >>>                      keypoint_roi_pool=keypoint_roi_pooler)
+        >>> model.eval()
+        >>> model.eval()
+        >>> x = [torch.rand(3, 300, 400), torch.rand(3, 500, 400)]
+        >>> predictions = model(x)
+    """
+    def __init__(self, backbone, num_classes=None,
+                 # transform parameters
+                 min_size=None, max_size=1333,
+                 image_mean=None, image_std=None,
+                 # RPN parameters
+                 rpn_anchor_generator=None, rpn_head=None,
+                 rpn_pre_nms_top_n_train=2000, rpn_pre_nms_top_n_test=1000,
+                 rpn_post_nms_top_n_train=2000, rpn_post_nms_top_n_test=1000,
+                 rpn_nms_thresh=0.7,
+                 rpn_fg_iou_thresh=0.7, rpn_bg_iou_thresh=0.3,
+                 rpn_batch_size_per_image=256, rpn_positive_fraction=0.5,
+                 # Box parameters
+                 box_roi_pool=None, box_head=None, box_predictor=None,
+                 box_score_thresh=0.05, box_nms_thresh=0.5, box_detections_per_img=100,
+                 box_fg_iou_thresh=0.5, box_bg_iou_thresh=0.5,
+                 box_batch_size_per_image=512, box_positive_fraction=0.25,
+                 bbox_reg_weights=None,
+                 # keypoint parameters
+                 keypoint_roi_pool=None, keypoint_head=None, keypoint_predictor=None,
+                 num_keypoints=17):
+
+        assert isinstance(keypoint_roi_pool, (MultiScaleRoIAlign, type(None)))
+        if min_size is None:
+            min_size = (640, 672, 704, 736, 768, 800)
+
+        if num_classes is not None:
+            if keypoint_predictor is not None:
+                raise ValueError("num_classes should be None when keypoint_predictor is specified")
+
+        out_channels = backbone.out_channels
+
+        if keypoint_roi_pool is None:
+            keypoint_roi_pool = MultiScaleRoIAlign(
+                featmap_names=[0, 1, 2, 3],
+                output_size=14,
+                sampling_ratio=2)
+
+        if keypoint_head is None:
+            keypoint_layers = tuple(512 for _ in range(8))
+            keypoint_head = KeypointRCNNHeads(out_channels, keypoint_layers)
+
+        if keypoint_predictor is None:
+            keypoint_dim_reduced = 512  # == keypoint_layers[-1]
+            keypoint_predictor = KeypointRCNNPredictor(keypoint_dim_reduced, num_keypoints)
+
+        super(KeypointRCNN, self).__init__(
+            backbone, num_classes,
+            # transform parameters
+            min_size, max_size,
+            image_mean, image_std,
+            # RPN-specific parameters
+            rpn_anchor_generator, rpn_head,
+            rpn_pre_nms_top_n_train, rpn_pre_nms_top_n_test,
+            rpn_post_nms_top_n_train, rpn_post_nms_top_n_test,
+            rpn_nms_thresh,
+            rpn_fg_iou_thresh, rpn_bg_iou_thresh,
+            rpn_batch_size_per_image, rpn_positive_fraction,
+            # Box parameters
+            box_roi_pool, box_head, box_predictor,
+            box_score_thresh, box_nms_thresh, box_detections_per_img,
+            box_fg_iou_thresh, box_bg_iou_thresh,
+            box_batch_size_per_image, box_positive_fraction,
+            bbox_reg_weights)
+
+        self.roi_heads.keypoint_roi_pool = keypoint_roi_pool
+        self.roi_heads.keypoint_head = keypoint_head
+        self.roi_heads.keypoint_predictor = keypoint_predictor
+
+
+class KeypointRCNNHeads(nn.Sequential):
+    def __init__(self, in_channels, layers):
+        d = []
+        next_feature = in_channels
+        for l in layers:
+            d.append(misc_nn_ops.Conv2d(next_feature, l, 3, stride=1, padding=1))
+            d.append(nn.ReLU(inplace=True))
+            next_feature = l
+        super(KeypointRCNNHeads, self).__init__(*d)
+        for m in self.children():
+            if isinstance(m, misc_nn_ops.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+                nn.init.constant_(m.bias, 0)
+
+
+class KeypointRCNNPredictor(nn.Module):
+    def __init__(self, in_channels, num_keypoints):
+        super(KeypointRCNNPredictor, self).__init__()
+        input_features = in_channels
+        deconv_kernel = 4
+        self.kps_score_lowres = misc_nn_ops.ConvTranspose2d(
+            input_features,
+            num_keypoints,
+            deconv_kernel,
+            stride=2,
+            padding=deconv_kernel // 2 - 1,
+        )
+        nn.init.kaiming_normal_(
+            self.kps_score_lowres.weight, mode="fan_out", nonlinearity="relu"
+        )
+        nn.init.constant_(self.kps_score_lowres.bias, 0)
+        self.up_scale = 2
+        self.out_channels = num_keypoints
+
+    def forward(self, x):
+        x = self.kps_score_lowres(x)
+        x = misc_nn_ops.interpolate(
+            x, scale_factor=self.up_scale, mode="bilinear", align_corners=False
+        )
+        return x
+
+
+model_urls = {
+    'keypointrcnn_resnet50_fpn_coco':
+        'https://download.pytorch.org/models/keypointrcnn_resnet50_fpn_coco-9f466800.pth',
+}
+
+
+def keypointrcnn_resnet50_fpn(pretrained=False, progress=True,
+                              num_classes=2, num_keypoints=17,
+                              pretrained_backbone=True, **kwargs):
+    """
+    Constructs a Keypoint R-CNN model with a ResNet-50-FPN backbone.
+
+    The input to the model is expected to be a list of tensors, each of shape ``[C, H, W]``, one for each
+    image, and should be in ``0-1`` range. Different images can have different sizes.
+
+    The behavior of the model changes depending if it is in training or evaluation mode.
+
+    During training, the model expects both the input tensors, as well as a targets dictionary,
+    containing:
+        - boxes (``Tensor[N, 4]``): the ground-truth boxes in ``[x0, y0, x1, y1]`` format, with values
+          between ``0`` and ``H`` and ``0`` and ``W``
+        - labels (``Tensor[N]``): the class label for each ground-truth box
+        - keypoints (``Tensor[N, K, 3]``): the ``K`` keypoints location for each of the ``N`` instances, in the
+          format ``[x, y, visibility]``, where ``visibility=0`` means that the keypoint is not visible.
+
+    The model returns a ``Dict[Tensor]`` during training, containing the classification and regression
+    losses for both the RPN and the R-CNN, and the keypoint loss.
+
+    During inference, the model requires only the input tensors, and returns the post-processed
+    predictions as a ``List[Dict[Tensor]]``, one for each input image. The fields of the ``Dict`` are as
+    follows:
+        - boxes (``Tensor[N, 4]``): the predicted boxes in ``[x0, y0, x1, y1]`` format, with values between
+          ``0`` and ``H`` and ``0`` and ``W``
+        - labels (``Tensor[N]``): the predicted labels for each image
+        - scores (``Tensor[N]``): the scores or each prediction
+        - keypoints (``Tensor[N, K, 3]``): the locations of the predicted keypoints, in ``[x, y, v]`` format.
+
+    Example::
+
+        >>> model = torchvision.models.detection.keypointrcnn_resnet50_fpn(pretrained=True)
+        >>> model.eval()
+        >>> x = [torch.rand(3, 300, 400), torch.rand(3, 500, 400)]
+        >>> predictions = model(x)
+
+    Arguments:
+        pretrained (bool): If True, returns a model pre-trained on COCO train2017
+        progress (bool): If True, displays a progress bar of the download to stderr
+    """
+    if pretrained:
+        # no need to download the backbone if pretrained is set
+        pretrained_backbone = False
+    backbone = resnet_fpn_backbone('resnet50', pretrained_backbone)
+    model = KeypointRCNN(backbone, num_classes, num_keypoints=num_keypoints, **kwargs)
+    if pretrained:
+        state_dict = load_state_dict_from_url(model_urls['keypointrcnn_resnet50_fpn_coco'],
+                                              progress=progress)
+        model.load_state_dict(state_dict)
+    return model
+
+
+torchvision_libs.group_by_aspect_ratio
+import bisect
+from collections import defaultdict
+import copy
+import numpy as np
+
+import torch
+import torch.utils.data
+from torch.utils.data.sampler import BatchSampler, Sampler
+from torch.utils.model_zoo import tqdm
+import torchvision
+
+from PIL import Image
+
+
+class GroupedBatchSampler(BatchSampler):
+    """
+    Wraps another sampler to yield a mini-batch of indices.
+    It enforces that the batch only contain elements from the same group.
+    It also tries to provide mini-batches which follows an ordering which is
+    as close as possible to the ordering from the original sampler.
+    Arguments:
+        sampler (Sampler): Base sampler.
+        group_ids (list[int]): If the sampler produces indices in range [0, N),
+            `group_ids` must be a list of `N` ints which contains the group id of each sample.
+            The group ids must be a continuous set of integers starting from
+            0, i.e. they must be in the range [0, num_groups).
+        batch_size (int): Size of mini-batch.
+    """
+    def __init__(self, sampler, group_ids, batch_size):
+        if not isinstance(sampler, Sampler):
+            raise ValueError(
+                "sampler should be an instance of "
+                "torch.utils.data.Sampler, but got sampler={}".format(sampler)
+            )
+        self.sampler = sampler
+        self.group_ids = group_ids
+        self.batch_size = batch_size
+
+    def __iter__(self):
+        buffer_per_group = defaultdict(list)
+        samples_per_group = defaultdict(list)
+
+        num_batches = 0
+        for idx in self.sampler:
+            group_id = self.group_ids[idx]
+            buffer_per_group[group_id].append(idx)
+            samples_per_group[group_id].append(idx)
+            if len(buffer_per_group[group_id]) == self.batch_size:
+                yield buffer_per_group[group_id]
+                num_batches += 1
+                del buffer_per_group[group_id]
+            assert len(buffer_per_group[group_id]) < self.batch_size
+
+        # now we have run out of elements that satisfy
+        # the group criteria, let's return the remaining
+        # elements so that the size of the sampler is
+        # deterministic
+        expected_num_batches = len(self)
+        num_remaining = expected_num_batches - num_batches
+        if num_remaining > 0:
+            # for the remaining batches, take first the buffers with largest number
+            # of elements
+            for group_id, _ in sorted(buffer_per_group.items(),
+                                      key=lambda x: len(x[1]), reverse=True):
+                remaining = self.batch_size - len(buffer_per_group[group_id])
+                buffer_per_group[group_id].extend(
+                    samples_per_group[group_id][:remaining])
+                assert len(buffer_per_group[group_id]) == self.batch_size
+                yield buffer_per_group[group_id]
+                num_remaining -= 1
+                if num_remaining == 0:
+                    break
+        assert num_remaining == 0
+
+    def __len__(self):
+        return len(self.sampler) // self.batch_size
+
+
+def _compute_aspect_ratios_slow(dataset, indices=None):
+    print("Your dataset doesn't support the fast path for "
+          "computing the aspect ratios, so will iterate over "
+          "the full dataset and load every image instead. "
+          "This might take some time...")
+    if indices is None:
+        indices = range(len(dataset))
+
+    class SubsetSampler(Sampler):
+        def __init__(self, indices):
+            self.indices = indices
+
+        def __iter__(self):
+            return iter(self.indices)
+
+        def __len__(self):
+            return len(self.indices)
+
+    sampler = SubsetSampler(indices)
+    data_loader = torch.utils.data.DataLoader(
+        dataset, batch_size=1, sampler=sampler,
+        num_workers=14,  # you might want to increase it for faster processing
+        collate_fn=lambda x: x[0])
+    aspect_ratios = []
+    with tqdm(total=len(dataset)) as pbar:
+        for i, (img, _) in enumerate(data_loader):
+            pbar.update(1)
+            height, width = img.shape[-2:]
+            aspect_ratio = float(height) / float(width)
+            aspect_ratios.append(aspect_ratio)
+    return aspect_ratios
+
+
+def _compute_aspect_ratios_custom_dataset(dataset, indices=None):
+    if indices is None:
+        indices = range(len(dataset))
+    aspect_ratios = []
+    for i in indices:
+        height, width = dataset.get_height_and_width(i)
+        aspect_ratio = float(height) / float(width)
+        aspect_ratios.append(aspect_ratio)
+    return aspect_ratios
+
+
+def _compute_aspect_ratios_coco_dataset(dataset, indices=None):
+    if indices is None:
+        indices = range(len(dataset))
+    aspect_ratios = []
+    for i in indices:
+        img_info = dataset.coco.imgs[dataset.ids[i]]
+        aspect_ratio = float(img_info["height"]) / float(img_info["width"])
+        aspect_ratios.append(aspect_ratio)
+    return aspect_ratios
+
+
+def _compute_aspect_ratios_voc_dataset(dataset, indices=None):
+    if indices is None:
+        indices = range(len(dataset))
+    aspect_ratios = []
+    for i in indices:
+        # this doesn't load the data into memory, because PIL loads it lazily
+        width, height = Image.open(dataset.images[i]).size
+        aspect_ratio = float(height) / float(width)
+        aspect_ratios.append(aspect_ratio)
+    return aspect_ratios
+
+
+def _compute_aspect_ratios_subset_dataset(dataset, indices=None):
+    if indices is None:
+        indices = range(len(dataset))
+
+    ds_indices = [dataset.indices[i] for i in indices]
+    return compute_aspect_ratios(dataset.dataset, ds_indices)
+
+
+def compute_aspect_ratios(dataset, indices=None):
+    if hasattr(dataset, "get_height_and_width"):
+        return _compute_aspect_ratios_custom_dataset(dataset, indices)
+
+    if isinstance(dataset, torchvision.datasets.CocoDetection):
+        return _compute_aspect_ratios_coco_dataset(dataset, indices)
+
+    if isinstance(dataset, torchvision.datasets.VOCDetection):
+        return _compute_aspect_ratios_voc_dataset(dataset, indices)
+
+    if isinstance(dataset, torch.utils.data.Subset):
+        return _compute_aspect_ratios_subset_dataset(dataset, indices)
+
+    # slow path
+    return _compute_aspect_ratios_slow(dataset, indices)
+
+
+def _quantize(x, bins):
+    bins = copy.deepcopy(bins)
+    bins = sorted(bins)
+    quantized = list(map(lambda y: bisect.bisect_right(bins, y), x))
+    return quantized
+
+
+def create_aspect_ratio_groups(dataset, k=0):
+    aspect_ratios = compute_aspect_ratios(dataset)
+    bins = (2 ** np.linspace(-1, 1, 2 * k + 1)).tolist() if k > 0 else [1.0]
+    groups = _quantize(aspect_ratios, bins)
+    # count number of elements per group
+    counts = np.unique(groups, return_counts=True)[1]
+    fbins = [0] + bins + [np.inf]
+    print("Using {} as bins for aspect ratio quantization".format(fbins))
+    print("Count of instances per bin: {}".format(counts))
+    return groups
